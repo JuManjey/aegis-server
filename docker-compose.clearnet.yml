@@ -1,0 +1,122 @@
+# AEGIS — клирнет-профиль: HTTPS-фронт релея и клирнет-доступ к coturn для
+# клиентов в режиме «Tor ВЫКЛ». Включается только осознанно, вместе с основным
+# файлом:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.clearnet.yml up -d --build
+#
+# (или один раз: echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.clearnet.yml' >> .env)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ДОБАВЛЯЕТ
+#
+#  * caddy — HTTPS (Let's Encrypt, автопродление) → aegis-relay:8080. ТОТ ЖЕ релей
+#    и ТА ЖЕ БД, что за onion: собеседники в разных режимах видят сообщения друг
+#    друга. Публикует 80/tcp (ACME HTTP-01 и редирект) и 443/tcp.
+#  * coturn — тот же экземпляр, что и для onion, плюс опубликованные 3478/udp,
+#    3478/tcp и TURNS 5349/tcp. Адрес ретрансляции остаётся внутренним, поэтому
+#    relay↔relay между onion- и клирнет-аллокациями — доставка внутри контейнера
+#    (см. docker/turn/turnserver.clearnet.conf). Диапазон relay-портов НЕ публикуется.
+#  * turn-certs — копирует сертификат Caddy для TURNS и даёт coturn перечитать его.
+#
+# Onion-доступ не меняется: старые и новые клиенты в режиме Tor работают как раньше.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ЭТО ЗНАЧИТ ДЛЯ ПРИВАТНОСТИ — прямо
+#
+#  * Клиенты в режиме «Tor ВЫКЛ» приходят с реальных IP. Сервер может сопоставлять
+#    IP с адресами ящиков. Пользователь видит это в диалоге выключения Tor.
+#  * Журналы не пишут адресов: у Caddy нет журнала доступа и отключены логгеры с
+#    remote_ip/URI, у coturn журнал выключен целиком, релей адресов не видит —
+#    Caddy вырезает X-Forwarded-For/Forwarded/X-Real-IP.
+#  * Шифрование не меняется: слои A/B, PSK-обёртка, DTLS-SRTP + кадровый AES-GCM.
+#
+# Подготовка (DNS, файрвол, .env) — README.md, раздел «Клирнет-профиль». Несовместим с
+# docker-compose.stun.yml (оба публикуют 3478/udp): клирнет-профиль его заменяет.
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: aegis-caddy
+    restart: unless-stopped
+    environment:
+      AEGIS_RELAY_DOMAIN: ${AEGIS_RELAY_DOMAIN:?укажите AEGIS_RELAY_DOMAIN=<домен> в .env}
+    ports:
+      - "${AEGIS_HTTPS_BIND:-0.0.0.0}:80:80/tcp"
+      - "${AEGIS_HTTPS_BIND:-0.0.0.0}:443:443/tcp"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      aegisnet:
+        ipv4_address: 172.28.7.40
+    depends_on:
+      relay:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  coturn:
+    # Тот же контейнер, что обслуживает onion; конфиг — с TLS и без журнала.
+    # init: turnserver не ставит обработчик SIGTERM и как PID 1 игнорирует его от
+    # процессов своего пространства PID — перезапуск от turn-certs не сработал бы.
+    # docker-init (tini) принимает сигналы и пересылает их turnserver.
+    init: true
+    volumes:
+      - ./docker/turn/turnserver.clearnet.conf:/etc/coturn/turnserver.conf:ro
+      - turn-certs:/turn-certs:ro
+    ports:
+      - "${AEGIS_TURN_BIND:-0.0.0.0}:3478:3478/udp"
+      - "${AEGIS_TURN_BIND:-0.0.0.0}:3478:3478/tcp"
+      - "${AEGIS_TURN_BIND:-0.0.0.0}:5349:5349/tcp"
+
+  turn-certs:
+    image: caddy:2.10-alpine
+    container_name: aegis-turn-certs
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/turn-certs.sh"]
+    environment:
+      AEGIS_TURN_DOMAIN: ${AEGIS_TURN_DOMAIN:-${AEGIS_RELAY_DOMAIN}}
+    volumes:
+      - ./docker/caddy/turn-certs.sh:/turn-certs.sh:ro
+      - caddy-data:/data:ro
+      - turn-certs:/turn-certs
+    # Пространство PID coturn: процесс coturn здесь — PID 1, ему и шлём сигналы.
+    pid: "service:coturn"
+    network_mode: none
+    depends_on:
+      - coturn
+      - caddy
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - KILL
+
+  relay:
+    # Клирнет STUN/TURN/TURNS своего coturn для клиентов без Tor (поле `uris` в
+    # GET /v1/turn). Забытая переменная ломает запуск сразу и с понятным текстом,
+    # а не превращается в молча неработающие звонки в режиме без Tor.
+    environment:
+      AEGIS_TURN_PUBLIC_URIS: ${AEGIS_TURN_PUBLIC_URIS:?укажите AEGIS_TURN_PUBLIC_URIS в .env (см. .env.example)}
+
+volumes:
+  caddy-data:
+  caddy-config:
+  turn-certs:

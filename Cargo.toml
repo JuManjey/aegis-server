@@ -1,0 +1,85 @@
+[package]
+name = "aegis-relay"
+version = "0.1.0"
+edition = "2021"
+description = "AEGIS backend: zero-trust релей/mailbox для доставки E2EE-конвертов клиента aegis (§7.6/§12.2). Хранит только непрозрачный шифртекст."
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "aegis-relay"
+path = "src/main.rs"
+
+# Офлайн-инструмент подписи конфиг-документа (§12.2): генерирует ключ Ed25519 и
+# подписывает адрес(а) релея для GET /v1/config. Собирается ТОЛЬКО с фичей
+# `tools` (`cargo run --features tools --bin aegis-config-sign ...`), поэтому в
+# продакшн-образ релея (обычная сборка без фич) НЕ попадает и приватный ключ на
+# сервере не появляется (zero-trust, §10.9).
+[[bin]]
+name = "aegis-config-sign"
+path = "src/bin/config_sign.rs"
+required-features = ["tools"]
+
+[features]
+# Инструменты сопровождения (офлайн-подпись конфига). Не включаются в проде.
+tools = ["dep:rand", "ed25519-dalek/rand_core"]
+
+[dependencies]
+# HTTP-сервер. Публикуется как Tor Onion Service v3 (§7.2/§12.2): tor-демон
+# форвардит HS→127.0.0.1:8080, приложение слушает только localhost.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+
+# Хранилище: SQLite (bundled — компилируется из исходников, без системной libsqlite3).
+# Хранит ТОЛЬКО непрозрачный шифртекст + непрозрачный mailbox-id + время (§7.6).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# (Де)сериализация JSON API.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# TURN REST-креды (coturn use-auth-secret, §7.5/§12.2): HMAC-SHA1 из аудированных
+# крейтов RustCrypto — свою крипту не пишем (§1). SHA-1 применяется только внутри
+# HMAC (требование протокола coturn), что остаётся стойким.
+hmac = "0.12"
+sha1 = "0.10"
+
+# SHA-256: proof-of-work на публичных маршрутах алиасов (`pow.rs`) и вывод
+# accountId из Ed25519-ключа при проверке заявки на алиас (`directory.rs`).
+# Тот же аудированный крейт, что в клиентском ядре (§1).
+sha2 = "0.10"
+
+# Логирование без чувствительных данных (§7.6).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+anyhow = "1"
+
+# Ed25519 (аудированный dalek — свою крипту не пишем, §1). Нужен в ОБЫЧНОЙ
+# сборке для ОДНОЙ операции: проверки самодостаточной заявки на публичный алиас
+# (`directory.rs`). Без неё алиас угонялся бы простой перезаписью записи, и
+# клиент, впервые ищущий ник, не смог бы отличить подмену. Приватного ключа у
+# сервера при этом НЕТ и не появляется (zero-trust §10.9): сервер лишь проверяет
+# подпись и коммитмент accountId, а клиент перепроверяет всё это заново сам.
+# Фича `rand_core` (генерация ключей) нужна только офлайн-инструменту `tools`.
+ed25519-dalek = "2"
+
+# --- Только для офлайн-инструмента подписи конфига (фича `tools`) ------------
+rand = { version = "0.8", optional = true }
+
+[dev-dependencies]
+# Интеграционные тесты роутера без реальной сети.
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Reproducible builds (P9, §9/§12.1): ремап абсолютных путей делается через
+# RUSTFLAGS="--remap-path-prefix=..." (см. scripts/verify-reproducible-build.sh),
+# т.к. профильный `trim-paths` в Cargo 1.97.0 ещё не стабилизирован.

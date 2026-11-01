@@ -1,0 +1,29 @@
+# Конфигурация tor для публикации AEGIS relay как Onion Service v3 (§7.2/§12.2).
+
+# Не поднимаем локальный SOCKS/исходящий прокси — нам нужен только HS-сервис.
+SocksPort 0
+
+# Логи в stdout (docker logs). Без чувствительных данных.
+Log notice stdout
+
+# Сбросить привилегии на пользователя пакета tor (запуск контейнера от root).
+User debian-tor
+
+DataDirectory /var/lib/tor
+
+# --- Onion Service v3 релея ---
+# hostname (адрес <56 символов>.onion) появится в /var/lib/tor/aegis/hostname.
+# Порт 443 onion → HTTP-порт relay (aegis-relay:8080) во внутренней compose-сети.
+# Порт 443 выбран, чтобы совпасть с портом по умолчанию клиента (host без ":port").
+HiddenServiceDir /var/lib/tor/aegis
+HiddenServiceVersion 3
+HiddenServicePort 443 aegis-relay:8080
+
+# --- Onion Service v3 для TCP-TURN (§7.5, медиа звонков через Tor) ---
+# Отдельный HS: адрес появится в /var/lib/tor/aegis-turn/hostname. Его нужно
+# вписать в .env как AEGIS_TURN_ONION, чтобы релей отдавал клиенту через
+# GET /v1/turn. Порт 3478 onion → TCP-порт coturn (aegis-coturn:3478).
+# Отдельный onion от релея → сервер не связывает трафик релея и TURN между собой.
+HiddenServiceDir /var/lib/tor/aegis-turn
+HiddenServiceVersion 3
+HiddenServicePort 3478 aegis-coturn:3478

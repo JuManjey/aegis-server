@@ -1,0 +1,9 @@
+target
+.env
+*.db
+*.db-wal
+*.db-shm
+.git
+.gitignore
+README.md
+PROTOCOL.md

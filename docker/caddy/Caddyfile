@@ -1,0 +1,68 @@
+# AEGIS — HTTPS-фронт релея для режима «Tor ВЫКЛ» (docker-compose.clearnet.yml).
+#
+# Тот же релей и та же БД, что за onion: Caddy только терминирует TLS и проксирует
+# на aegis-relay:8080. Сертификат Let's Encrypt Caddy получает сам при первом
+# запросе к домену и обновляет автоматически (примерно за 30 дней до истечения).
+#
+# ПРИВАТНОСТЬ ЖУРНАЛОВ. Журнала доступа нет (директивы `log` в сайте нет). Логгеры,
+# которые пишут адрес клиента или URI запроса (а в URI — id ящиков, это
+# capability), исключены: http.log.error (ошибки обработки запроса вместе с
+# remote_ip и uri), http.stdlib (ошибки TLS-рукопожатий с адресом клиента),
+# http.handlers.reverse_proxy. Остаются служебные записи: получение и
+# продление сертификата, запуск и остановка.
+{
+	admin off
+	servers {
+		# HTTP/3 (UDP 443) не нужен: клиент ходит по HTTP/1.1 через HttpsURLConnection.
+		protocols h1 h2
+		timeouts {
+			read_header 30s
+			# Это полные сроки запроса и ответа, а не простоя: блоб до 32 МиБ по
+			# медленной мобильной сети (~50 КБ/с) должен успеть загрузиться и
+			# скачаться целиком. Long-poll (до 120 с) укладывается с запасом.
+			read_body 15m
+			write 15m
+			idle 2m
+		}
+	}
+	log default {
+		output stderr
+		format console
+		exclude http.log.access http.log.error http.stdlib http.handlers.reverse_proxy
+	}
+}
+
+{$AEGIS_RELAY_DOMAIN} {
+	request_body {
+		# Чуть выше серверного капа блоба (AEGIS_BLOB_MAX_BYTES ≤ 32 МиБ).
+		# Именно MiB: «MB» у Caddy десятичные, 33MB меньше 32 МиБ.
+		max_size 33MiB
+	}
+	reverse_proxy aegis-relay:8080 {
+		# Релей не должен получать адрес клиента вовсе — ни в каком заголовке.
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Host
+		header_up -X-Forwarded-Proto
+		header_up -X-Real-IP
+		header_up -Forwarded
+		header_up -Via
+		transport http {
+			dial_timeout 5s
+			# Не короче long-poll: AEGIS_MAX_WAIT_SECS клемпится сервером до 120 с.
+			response_header_timeout 180s
+			read_timeout 180s
+			write_timeout 180s
+		}
+	}
+	header {
+		-Server
+		-Via
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+	}
+	# Ответы на ошибки (релей недоступен и т. п.) Caddy пишет мимо блока выше.
+	handle_errors {
+		header -Server
+		header -Via
+	}
+}

@@ -1,0 +1,9 @@
+# AEGIS relay — фиксация Rust-тулчейна для ВОСПРОИЗВОДИМЫХ СБОРОК (P9, §9/§12.1).
+#
+# Версия ДОЛЖНА совпадать с базовым образом в Dockerfile (rust:1.97.0-bookworm)
+# и с клиентским rust-toolchain.toml — единый тулчейн на весь продукт.
+# Канал "stable" не используем: он плавает и ломает воспроизводимость.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

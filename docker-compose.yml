@@ -1,0 +1,151 @@
+# AEGIS backend — деплой через Docker Compose (§12.2).
+#
+# Три сервиса:
+#   relay  — HTTP-релей (Rust axum), слушает только внутри compose-сети;
+#   coturn — TCP-TURN для медиа звонков (§7.5), только внутри сети;
+#   tor    — публикует relay и coturn как Onion Service v3 (два HS):
+#              443  → relay:8080   (mailbox/prekeys/turn API)
+#              3478 → coturn:3478  (TCP-TURN)
+#
+# НАРУЖУ (на хост/интернет) НЕ проброшено НИ ОДНОГО порта: единственная точка
+# входа — .onion-адреса (§7.2/§10.7). Обновление: `git pull` + `docker compose up -d --build`.
+#
+# Сеть закреплена статически (см. блок `networks` внизу). Это не косметика:
+# coturn объявляет собственный адрес compose-сети как relay-адрес TURN, и тот же
+# адрес прописан в `allowed-peer-ip`. Если позволить Docker выбирать подсеть
+# самому, после `docker compose down && up` она может смениться (172.18 → 172.19),
+# и TURN замолчит без единой ошибки в логах — просто ни одна пара кандидатов не
+# станет писуемой.
+
+services:
+  relay:
+    build: .
+    image: aegis-relay:latest
+    container_name: aegis-relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - relay-data:/data
+    networks:
+      aegisnet:
+        ipv4_address: 172.28.7.20
+    # HEALTHCHECK определён в Dockerfile (GET /v1/health). Дублируем интервалы
+    # здесь, чтобы `depends_on: service_healthy` у tor имел предсказуемое окно.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/v1/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # Журналы не должны съесть диск на маленьком VPS.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Ужесточение прав: релей не нуждается ни в одной Linux capability и не
+    # пишет никуда, кроме своего тома с БД.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # ports: НЕ публикуем — доступ только через tor.
+
+  # TCP-TURN за onion (§7.5). Ретранслирует ТОЛЬКО шифртекст (медиа E2EE
+  # DTLS-SRTP); оба пира приходят из Tor, поэтому IP/личности скрыты (zero-trust).
+  # Секрет берётся из .env (AEGIS_TURN_SECRET) и совпадает с секретом релея,
+  # который выдаёт клиенту эфемерные креды через GET /v1/turn.
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: aegis-coturn
+    restart: unless-stopped
+    env_file:
+      - .env
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --static-auth-secret=${AEGIS_TURN_SECRET:?set AEGIS_TURN_SECRET in .env}
+      - --realm=${AEGIS_TURN_REALM:-aegis}
+    volumes:
+      - ./docker/turn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    networks:
+      aegisnet:
+        # ОБЯЗАН совпадать с relay-ip и allowed-peer-ip в turnserver.conf.
+        ipv4_address: 172.28.7.10
+    # ports: НЕ публикуем — доступ только через tor (второй HS).
+    #
+    # ИСКЛЮЧЕНИЕ — публичный STUN для прямых звонков. Он НЕ включён здесь
+    # намеренно: публикация порта в интернет не должна появляться на сервере
+    # молча, одним `git pull`. Включается отдельным overlay-файлом:
+    #   docker compose -f docker-compose.yml -f docker-compose.stun.yml up -d
+    # Подробности и последствия для приватности — в docker-compose.stun.yml.
+    # Проверка «порт TURN принимает TCP-соединения». Обычный HTTP-запрос сюда
+    # не годится (это STUN/TURN, не HTTP), поэтому проверяем именно установку
+    # TCP-соединения через /dev/tcp встроенными средствами bash.
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 3 bash -c '</dev/tcp/127.0.0.1/3478' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+
+  tor:
+    build: ./docker/tor
+    image: aegis-tor:latest
+    container_name: aegis-tor
+    restart: unless-stopped
+    volumes:
+      # Персистит onion-адреса (hostname) и приватные ключи HS между рестартами.
+      - tor-data:/var/lib/tor
+    networks:
+      aegisnet:
+        ipv4_address: 172.28.7.30
+    # Ждём именно ГОТОВНОСТИ, а не просто запуска контейнеров: tor начинает
+    # публиковать дескрипторы HS сразу, и если бэкенды в этот момент ещё не
+    # слушают, первые клиенты получают отказ соединения по уже опубликованному
+    # адресу — самый неприятный вид «сервер вроде работает, а не работает».
+    depends_on:
+      relay:
+        condition: service_healthy
+      coturn:
+        condition: service_healthy
+    # Onion Service считаем живым, когда tor опубликовал оба дескриптора, то есть
+    # файлы hostname созданы.
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /var/lib/tor/aegis/hostname && test -s /var/lib/tor/aegis-turn/hostname || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    security_opt:
+      - no-new-privileges:true
+    # Даём tor доработать корректно: обрыв на середине публикации дескриптора
+    # заставляет клиентов ждать следующей публикации.
+    stop_grace_period: 30s
+
+volumes:
+  relay-data:
+  tor-data:
+
+networks:
+  aegisnet:
+    driver: bridge
+    ipam:
+      config:
+        # Подсеть закреплена: от адреса coturn зависят relay-ip и allowed-peer-ip
+        # в turnserver.conf. При конфликте с существующей сетью на хосте меняйте
+        # подсеть ЗДЕСЬ И В turnserver.conf одновременно.
+        - subnet: 172.28.7.0/24

@@ -1,0 +1,85 @@
+# AEGIS relay (backend) — Continuous Integration (P9, §9/§12.2).
+#
+# Прогон формата/линта/тестов и релизной сборки бинаря aegis-relay + сборка
+# Docker-образа на каждый push/PR. Тулчейн пинуется rust-toolchain.toml (1.97.0).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: rust (fmt · clippy · tests · release build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show pinned toolchain
+        run: |
+          rustup show active-toolchain || true
+          rustc --version
+          cargo --version
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked
+
+      # Интеграционные тесты роутера без реальной сети: 22/22 (§1.25).
+      - name: Tests
+        run: cargo test --locked
+
+      # Та же команда, что в Dockerfile и verify-скрипте (--locked).
+      - name: Release build
+        run: cargo build --release --locked
+
+  docker:
+    name: docker build (rust:1.97.0-bookworm)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Собираем образ по Dockerfile (multi-stage). Не пушим — только проверка,
+      # что образ собирается воспроизводимо (база пинована по версии).
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: aegis-relay:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
